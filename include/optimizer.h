@@ -11,17 +11,12 @@
 
     This is the output of the optimizer
     and the input to the Devpac backend.
-
 */
-
 typedef struct
 {
     uint8_t mixer;
-
     uint8_t volume[3];
-
     uint8_t noise_period;
-
 
     /* YM register latch position.
         -1 after reset
@@ -29,43 +24,35 @@ typedef struct
     */
     int8_t selected_register;
 
-
     /* Estimated analog output level. */
     float amplitude;
-
 } YMState;
 
 
 
 /* Candidate state. Generated during optimization. */
-
 typedef struct
 {
     YMState state;
 
-    /* Difference between target PCM
-        and generated YM output. */
+    /* Difference between target PCM and generated YM output. */
     float audio_error;
 
     /* Estimated 68000/YM bus cost. */
-    int cycle_cost;
+    uint16_t cycle_cost;
 
     /* Combined optimization metric. */
     float total_cost;
-
 } Candidate;
 
-#define MAX_CANDIDATES 256
+#define MAX_CANDIDATES 255
 
 /* Optimizer state. */
 typedef struct
 {
     YMState current;
-
     Candidate candidates[MAX_CANDIDATES];
-
-    int candidate_count;
-
+    uint8_t candidate_count;
 } Optimizer;
 
 
@@ -77,23 +64,27 @@ typedef struct
 
 
 /* Initialize optimizer. */
-void optimizer_init(Optimizer *const opt);
+void optimizer_init(Optimizer *opt);
 
 /* Generate possible YM states around the current state. */
-void optimizer_generate_candidates(Optimizer *const opt, const float target);
+void optimizer_generate_candidates(Optimizer *opt, float target);
 
 /* Generate candidates including YM noise dithering. */
-void optimizer_generate_candidates_noise(Optimizer *const opt, const float target, SigmaDeltaState *const sd);
+void optimizer_generate_candidates_noise(Optimizer *opt, float target, SigmaDeltaState *sd);
 
-/* Run Viterbi optimization. Converts PCM samples into a YM state sequence. */
-void optimizer_optimize(Optimizer *const opt, const float *samples, const int count, YMState *const output);
+uint16_t optimizer_transition_cost(const YMState *old, const YMState *next);
 
-/* Cost evaluation for a candidate. */
-float optimizer_state_cost(const Candidate *candidate, const float target, SigmaDeltaState *const sd);
+/* Existing optimizer helpers. */
+int optimizer_best_candidate(Optimizer *opt);
+void optimizer_commit(Optimizer *opt, const YMState *state);
 
-/* Commit chosen state. */
-void optimizer_commit_state(Optimizer *const opt, Candidate *const chosen, SigmaDeltaState *const sd, const float target);
+/* Maximum output amplitude supported by the YM output model. */
+float optimizer_output_max(void);
 
-int optimizer_transition_cost(const YMState *old, const YMState *next);
+int optimizer_update_sigma_delta(SigmaDeltaState *sd, float input, float output);
+
+int pcm_to_quantizer_target(
+    const float pcm,
+    float *const target);
 
 #endif

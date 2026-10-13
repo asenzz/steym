@@ -1,7 +1,10 @@
 #ifndef STE_YM_VITERBI_H
 #define STE_YM_VITERBI_H
 
-#include "optimizer.h"
+#include <stddef.h>
+#include <stdint.h>
+
+#include "scheduler.h"
 
 #define BEAM_WIDTH 64
 
@@ -9,9 +12,8 @@ typedef struct
 {
     YMState ym;
 
-    /* YM register latch state. Needed because it changes future cycle cost. */
-
-    int latch;
+    /* Register shadow and actual YM latch for this search path. */
+    SchedulerState scheduler;
 
     /* Noise sigma-delta state. */
 
@@ -28,12 +30,14 @@ typedef struct
 {
     ViterbiNode node[BEAM_WIDTH];
 
-    int count;
+    uint8_t count;
 
 } ViterbiBeam;
 
 
-void viterbi_optimize(const float *pcm, const int samples, YMState *const output);
+/* Returns 0 on success and -1 on invalid input, allocation failure,
+   or when no cycle-feasible path can be found. */
+int viterbi_optimize(const float *pcm, size_t samples, YMState *output);
 
 
 #endif

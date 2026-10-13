@@ -1,161 +1,257 @@
 /*
     viterbi.c
 
-    Beam-search Viterbi optimizer
-    for Atari STE YM2149 PCM playback.
-
+    Beam-search Viterbi optimizer for Atari STE YM2149 PCM playback.
 */
 
-
+#include <float.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
+
 #include "viterbi.h"
-#include "scheduler.h"
 
-
-#define INF 1e30f
-#define AUDIO_WEIGHT       100000.0f
-#define FUTURE_WEIGHT      50000.0f
-#define CYCLE_WEIGHT       1000000.0f
-#define NOISE_WEIGHT       20000.0f
-
+#define AUDIO_WEIGHT  100000.0f
+#define FUTURE_WEIGHT 50000.0f
+#define NOISE_WEIGHT  20000.0f
 
 static float absf_fast(const float x)
 {
-    return x < 0 ? -x : x;
+    return x < 0.0f ? -x : x;
 }
 
-
-/* YM + noise output model. */
-static float model_output(const YMState *s, float noise_error)
+/* Full transition cost, including the scheduler's modeled cycle count. */
+static float transition_cost(
+    const ViterbiNode *old,
+    const Candidate *candidate,
+    const float current_target,
+    const float next_target,
+    const uint16_t cycles)
 {
-    float v = s->amplitude;
+    float decision_target = current_target + old->noise_error;
+    const float full_scale = optimizer_output_max();
+    if (decision_target < 0.0f)
+        decision_target = 0.0f;
+    else if (decision_target > full_scale)
+        decision_target = full_scale;
 
-    /* Noise contribution.
-
-        Small because noise is used
-        as dithering, not primary audio.
-    */
-
-    v += noise_error * 0.05f;
-    return v;
-}
-
-
-/* Calculate scheduler legality. */
-static float cycle_cost(const YMState *state, const int latch)
-{
-    SchedulerState scheduler;
-    SampleSlot slot;
-    scheduler_init( &scheduler);
-    scheduler.latch = latch;
-
-    const int cycles = scheduler_make_slot( &scheduler, state, &slot);
-    if(cycles<=SAMPLE_CYCLES) return 0;
-    return (cycles - SAMPLE_CYCLES) * CYCLE_WEIGHT;
-}
-
-
-/* Full transition cost. */
-static float transition_cost(const ViterbiNode *old, const Candidate *candidate, const float current_pcm, const float next_pcm)
-{
-    float cost=0;
-
-    /* Current audio error. */
-    const float out = model_output( &candidate->state, old->noise_error);
-    cost += absf_fast( current_pcm - out) * AUDIO_WEIGHT;
-
-    /* Look ahead. */
-    const float next_error = absf_fast( next_pcm - candidate->state.amplitude);
-    cost += next_error * FUTURE_WEIGHT;
-
-    /* YM bus transition. */
-    cost += optimizer_transition_cost( &old->ym, &candidate->state);
-
-    /* Exact 182 cycle constraint. */
-    cost += cycle_cost( &candidate->state, old->latch);
-
-    /* Noise sigma delta. */
-    cost += absf_fast( old->noise_error) * NOISE_WEIGHT;
-
+    float cost = absf_fast(decision_target - candidate->state.amplitude)
+                 * AUDIO_WEIGHT;
+    cost += absf_fast(next_target - candidate->state.amplitude)
+            * FUTURE_WEIGHT;
+    cost += (float)cycles;
+    cost += absf_fast(old->noise_error) * NOISE_WEIGHT;
     return cost;
 }
 
-
-/* Insert node into beam. */
-static void beam_insert(ViterbiBeam *const beam, const ViterbiNode *node)
+/* Keep the lowest-cost BEAM_WIDTH nodes, in ascending cost order. */
+static void beam_insert(ViterbiBeam *const beam, const ViterbiNode *const node)
 {
-    int pos=-1;
-    for(int i=0; i<beam->count; ++i) 
-        if(node->cost < beam->node[i].cost) {
-            pos=i;
+    uint16_t pos = UINT16_MAX;
+
+    if (beam == NULL || node == NULL ||
+        !isfinite(node->cost) || node->cost < 0.0f)
+        return;
+
+    for (uint16_t i = 0; i < beam->count; ++i) {
+        if (node->cost < beam->node[i].cost) {
+            pos = i;
             break;
         }
+    }
 
-    if(pos<0) {
-        if(beam->count<BEAM_WIDTH) beam->node[ beam->count++ ]=*node;
+    if (pos == UINT16_MAX) {
+        if (beam->count < BEAM_WIDTH)
+            beam->node[beam->count++] = *node;
         return;
     }
 
-    if(beam->count<BEAM_WIDTH) ++beam->count;
+    if (beam->count < BEAM_WIDTH)
+        ++beam->count;
 
-    for(int i=beam->count-1; i>pos; --i) beam->node[i]= beam->node[i-1];
+    for (uint16_t i = (uint16_t)(beam->count - 1); i > pos; --i)
+        beam->node[i] = beam->node[i - 1];
 
-    beam->node[pos]= *node;
+    beam->node[pos] = *node;
 }
 
-
-/* Optimize complete PCM. */
-void viterbi_optimize(const float *pcm, const int samples, YMState *const output)
+/* Optimize the complete PCM sequence. Returns 0 on success, -1 on failure. */
+int viterbi_optimize(const float *const pcm, const size_t samples,
+                     YMState *const output)
 {
-    Optimizer optimizer;
-    optimizer_init(&optimizer);
-    ViterbiBeam current;
-    memset(&current, 0, sizeof(current));
-    current.count=1;
-    current.node[0].ym = optimizer.current;
-    current.node[0].latch=-1;
-    current.node[0].noise_error=0;
-    current.node[0].cost=0;
-    ViterbiBeam *const history = malloc(sizeof(ViterbiBeam) * samples);
-    for(int n=0; n<samples; ++n) {
-        ViterbiBeam next;
-        memset( &next, 0, sizeof(next));
-        for(int b=0; b<current.count; ++b) {
-            optimizer.current = current.node[b].ym;
-            SigmaDeltaState sd;
-            memset(&sd, 0, sizeof(sd));
-            optimizer_generate_candidates_noise( &optimizer, pcm[n], &sd);
-            for(int c=0; c<optimizer.candidate_count; ++c) {
-                ViterbiNode node;
-                node.ym = optimizer.candidates[c].state;
-                node.latch = node.ym.selected_register;
-                node.noise_error = current.node[b].noise_error + pcm[n] - node.ym.amplitude;
-                node.cost = current.node[b].cost + transition_cost(&current.node[b], &optimizer.candidates[c], pcm[n], n+1<samples ? pcm[n+1] : pcm[n]);
-                node.previous=b;
-                beam_insert(&next, &node);
+    if (pcm == NULL || output == NULL || samples == 0) {
+        fprintf(stderr, "viterbi_optimize: invalid input or empty sample sequence.\n");
+        return -1;
+    }
+
+    if (samples > SIZE_MAX / sizeof(ViterbiBeam)) {
+        fprintf(stderr, "viterbi_optimize: sample count is too large.\n");
+        return -1;
+    }
+
+    int result = -1;
+    ViterbiBeam *history = NULL;
+    ViterbiBeam *current = NULL;
+    ViterbiBeam *next = NULL;
+    Optimizer *optimizer = NULL;
+
+    history = calloc(samples, sizeof(*history));
+    optimizer = malloc(sizeof(*optimizer));
+    current = calloc(1, sizeof(*current));
+    next = malloc(sizeof(*next));
+    if (history == NULL || optimizer == NULL || current == NULL || next == NULL) {
+        fprintf(stderr, "viterbi_optimize: allocation failed for %zu samples.\n", samples);
+        goto cleanup;
+    }
+
+    optimizer_init(optimizer);
+
+    current->count = 1;
+    current->node[0].ym = optimizer->current;
+    scheduler_init(&current->node[0].scheduler);
+    current->node[0].ym.selected_register =
+        (int8_t)current->node[0].scheduler.latch;
+    current->node[0].noise_error = 0.0f;
+    current->node[0].cost = 0.0f;
+    current->node[0].previous = -1;
+
+    for (size_t n = 0; n < samples; ++n) {
+        float target;
+        float next_target;
+
+        if (!pcm_to_quantizer_target(pcm[n], &target) ||
+            !pcm_to_quantizer_target(pcm[n + 1 < samples ? n + 1 : n],
+                                     &next_target)) {
+            fprintf(stderr, "viterbi_optimize: invalid PCM value at sample %zu.\n", n);
+            goto cleanup;
+        }
+
+        memset(next, 0, sizeof(*next));
+
+        for (uint8_t b = 0; b < current->count; ++b) {
+            const ViterbiNode *const parent = &current->node[b];
+
+            if (!isfinite(parent->noise_error) || !isfinite(parent->cost))
+                continue;
+
+            optimizer->current = parent->ym;
+
+            /* Candidate generation receives this path's feedback residual. */
+            SigmaDeltaState parent_sd = { .error = parent->noise_error };
+            optimizer_generate_candidates_noise(optimizer, target, &parent_sd);
+
+            for (uint16_t c = 0; c < optimizer->candidate_count; ++c) {
+                const Candidate *const candidate = &optimizer->candidates[c];
+                if (!isfinite(candidate->state.amplitude))
+                    continue;
+
+                /* Compute the transition from this path's actual register shadow. */
+                SampleSlot slot;
+                const uint16_t cycles = scheduler_make_slot(
+                    &parent->scheduler, &candidate->state, &slot);
+
+                /* Reserve time for the delay sequence as well as YM writes. */
+                if (cycles > MAX_SLOT_OPERATION_CYCLES)
+                    continue;
+
+                SchedulerState next_scheduler = parent->scheduler;
+                scheduler_commit_slot(&next_scheduler, &slot);
+
+                /* Every child has its own feedback accumulator. */
+                SigmaDeltaState child_sd = { .error = parent->noise_error };
+                if (!optimizer_update_sigma_delta(
+                        &child_sd, target, candidate->state.amplitude))
+                    continue;
+
+                ViterbiNode node = {0};
+                node.ym = candidate->state;
+                node.scheduler = next_scheduler;
+                node.ym.selected_register = next_scheduler.latch == UINT8_MAX
+                    ? -1
+                    : (int8_t)next_scheduler.latch;
+                node.noise_error = child_sd.error;
+                node.previous = (int)b;
+
+                const float step_cost = transition_cost(
+                    parent, candidate, target, next_target, cycles);
+                const double total_cost = (double)parent->cost + step_cost;
+
+                if (!isfinite(step_cost) || step_cost < 0.0f ||
+                    !isfinite(total_cost) || total_cost > (double)FLT_MAX)
+                    continue;
+
+                node.cost = (float)total_cost;
+                if (!isfinite(node.cost))
+                    continue;
+
+                beam_insert(next, &node);
             }
         }
 
-        history[n]=current;
-        current=next;
+        if (next->count == 0) {
+            fprintf(stderr,
+                    "viterbi_optimize: no cycle-feasible candidates at sample %zu.\n",
+                    n);
+            goto cleanup;
+        }
+
+        /* Remove a common offset to limit long-run floating-point growth. */
+        const float base_cost = next->node[0].cost;
+        for (uint8_t i = 0; i < next->count; ++i) {
+            next->node[i].cost -= base_cost;
+            if (!isfinite(next->node[i].cost)) {
+                fprintf(stderr, "viterbi_optimize: non-finite beam cost at sample %zu.\n", n);
+                goto cleanup;
+            }
+        }
+
+        /* history[n] is the beam preceding sample n; children point into it. */
+        history[n] = *current;
+        ViterbiBeam *const temp = current;
+        current = next;
+        next = temp;
     }
 
-    /* Select cheapest final state. */
-    int best=0;
-    for(int i=1; i<current.count; i++) 
-        if(current.node[i].cost < current.node[best].cost) 
-	    best=i;
+    if (current->count == 0)
+        goto cleanup;
 
-    /* Backtracking. The compact version stores only
-        predecessor indices. A production
-        compiler should store full beam
-        history. */
-    for(int i=samples-1; i>=0; i--) {
-        output[i]= current.node[best].ym;
-        best = current.node[best].previous;
+    size_t best = 0;
+    for (size_t i = 1; i < current->count; ++i) {
+        if (current->node[i].cost < current->node[best].cost)
+            best = i;
     }
 
+    /* Backtrack through each preceding beam, not repeatedly through the final beam. */
+    const ViterbiBeam *beam = current;
+    for (size_t t = samples; t > 0; --t) {
+        if (best >= beam->count) {
+            fprintf(stderr, "viterbi_optimize: invalid backpointer at sample %zu.\n", t - 1);
+            goto cleanup;
+        }
+
+        const ViterbiNode *const node = &beam->node[best];
+        output[t - 1] = node->ym;
+
+        if (t > 1) {
+            const int previous = node->previous;
+            beam = &history[t - 1];
+
+            if (previous < 0 || (size_t)previous >= beam->count) {
+                fprintf(stderr, "viterbi_optimize: invalid predecessor at sample %zu.\n", t - 1);
+                goto cleanup;
+            }
+            best = (size_t)previous;
+        }
+    }
+
+    result = 0;
+
+cleanup:
     free(history);
+    free(current);
+    free(next);
+    free(optimizer);
+    return result;
 }

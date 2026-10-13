@@ -14,8 +14,8 @@
 #include "scheduler.h"
 
 
-#define YM_SELECT_COST 16
-#define YM_WRITE_COST  16
+#define YM_SELECT_COST 20
+#define YM_WRITE_COST  20
 
 
 static const uint8_t order[] =
@@ -28,7 +28,7 @@ static const uint8_t order[] =
 };
 
 
-static uint8_t get_register(const YMState *s, const int r)
+static uint8_t get_register(const YMState *s, const uint8_t r)
 {
     switch(r)
     {
@@ -54,86 +54,100 @@ static void add_operation(SampleSlot *const slot, const uint8_t reg, const uint8
     if(slot->count >= MAX_OPERATIONS) return;
     slot->op[slot->count].reg = reg;
     slot->op[slot->count].value = value;
-    slot->count++;
+    ++(slot->count);
 }
 
 
-/* Calculate exact scheduler cost. */
-static int calculate_cycles(SampleSlot *const slot)
+/* Estimate the 68000 instruction cycles for this operation sequence. */
+static uint16_t calculate_cycles(SampleSlot *const slot)
 {
-    int cycles=0;
-    int latch = slot->initial_latch;
-    for(int i=0; i<slot->count; ++i) {
-        if(latch != slot->op[i].reg) {
+    uint16_t cycles = 0;
+    uint8_t latch = slot->initial_latch;
+
+    for (uint8_t i = 0; i < slot->count; ++i) {
+        if (latch != slot->op[i].reg) {
             cycles += YM_SELECT_COST;
             latch = slot->op[i].reg;
         }
+
         cycles += YM_WRITE_COST;
     }
 
     slot->final_latch = latch;
     slot->cycles = cycles;
+
     return cycles;
 }
 
 
 /* Create a raw slot from YM state. */
-int scheduler_make_slot(SchedulerState *const scheduler, const YMState *const input, SampleSlot *const slot)
+uint16_t scheduler_make_slot(const SchedulerState *state, const YMState *state_in, SampleSlot *const slot)
 {
+    if (state == NULL || state_in == NULL || slot == NULL)
+        return SAMPLE_CYCLES + 1;
+
     memset(slot, 0, sizeof(*slot));
-    slot->initial_latch = scheduler->latch;
-    for (unsigned i=0; i<sizeof(order); ++i) {
-        const int r = order[i];
-        const uint8_t value = get_register(input, r);
-        if(scheduler->reg[r] != value) add_operation(slot, r, value);
+    slot->initial_latch = state->latch;
+    for (uint8_t i = 0; i < sizeof(order); ++i) {
+        const uint8_t r = order[i];
+        const uint8_t value = get_register(state_in, r);
+        if(state->reg[r] != value) add_operation(slot, r, value);
     }
-    calculate_cycles(slot);
-    return slot->cycles;
+    return calculate_cycles(slot);
 }
 
 
 /* Score alternative candidate. */
-static float candidate_score(const Candidate *candidate, const int cycles)
+static float candidate_score(const Candidate *candidate, const uint16_t cycles)
 {
-    int overflow = cycles - SAMPLE_CYCLES;
-    if(overflow<0) overflow=0;
-    return candidate->audio_error * 100000.0f + candidate->cycle_cost + overflow * 1000000.0f;
+    (void)cycles;
+    return candidate->audio_error * 100000.0f + candidate->cycle_cost;
 }
 
 
 /* Feedback search. */
-int scheduler_make_slot_feedback( SchedulerState *const scheduler, const Candidate *candidates, const int candidate_count, YMState *const chosen, SampleSlot *const best_slot)
+uint16_t scheduler_make_slot_feedback(const SchedulerState *state, const Candidate *candidates, const uint8_t candidate_count, YMState *const chosen, SampleSlot *const slot)
 {
-    float best = 1e30f;
-    int best_index=-1;
+    if (state == NULL || candidates == NULL || candidate_count == 0 ||
+        chosen == NULL || slot == NULL)
+        return SAMPLE_CYCLES + 1;
 
-    for(int i=0; i<candidate_count; ++i) {
+    float best = INFINITY;
+    uint16_t best_index = UINT16_MAX;
+    SampleSlot best_slot;
+
+    for (uint16_t i = 0; i < candidate_count; ++i) {
         SampleSlot test;
-        int cycles = scheduler_make_slot(scheduler, &candidates[i].state, &test);
-        float score = candidate_score(&candidates[i], cycles);
+        const uint16_t cycles = scheduler_make_slot(state, &candidates[i].state, &test);
+        if (cycles > MAX_SLOT_OPERATION_CYCLES)
+            continue;
 
-        /* Legal slots strongly preferred. */
-        if(cycles <= SAMPLE_CYCLES) score -= 500000.0f;
-
-        if(score < best) {
+        const float score = candidate_score(&candidates[i], cycles);
+        if (isfinite(score) && score < best) {
             best = score;
-            best_index=i;
-            *best_slot = test;
+            best_index = i;
+            best_slot = test;
         }
     }
 
-    if(best_index < 0) return -1;
+    if (best_index == UINT16_MAX)
+        return SAMPLE_CYCLES + 1;
 
     *chosen = candidates[best_index].state;
-    return best_slot->cycles;
+    *slot = best_slot;
+    return best_slot.cycles;
 }
 
 
 /* Commit emitted slot. The next slot starts with the correct YM latch. */
 void scheduler_commit_slot(SchedulerState *const scheduler, const SampleSlot *slot)
 {
-    for(int i=0; i<slot->count; ++i) 
-        scheduler->reg[ slot->op[i].reg ] = slot->op[i].value;
+    if (scheduler == NULL || slot == NULL)
+        return;
+
+    for(uint8_t i = 0; i < slot->count; ++i)
+        if (slot->op[i].reg < REG_COUNT)
+            scheduler->reg[ slot->op[i].reg ] = slot->op[i].value;
     scheduler->latch = slot->final_latch;
 }
 
@@ -141,15 +155,32 @@ void scheduler_commit_slot(SchedulerState *const scheduler, const SampleSlot *sl
 /* Append final slot. */
 void scheduler_append_slot(ScheduledStream *const stream, const SampleSlot *slot)
 {
-    stream->slots[ stream->count++ ] = *slot;
+    if (stream == NULL || stream->slots == NULL || slot == NULL ||
+        stream->count == UINT32_MAX)
+        return;
+
+    stream->slots[ stream->count ] = *slot;
+    ++(stream->count);
 }
 
 
 /* Initialize. */
-void scheduler_init(SchedulerState *const scheduler)
+void scheduler_init(SchedulerState *const state)
 {
-    memset(scheduler, 0, sizeof(*scheduler));
-    scheduler->latch=-1;
-    for(int i=0;i<16;++i)
-        scheduler->reg[i]=0xff;
+    if (state == NULL)
+        return;
+
+    /*
+     * Match the known startup writes emitted at the beginning of ym_player:
+     * R7=mixer YM_INITIAL_MIXER, R6=noise period YM_INITIAL_NOISE_PERIOD,
+     * R8-R10 volume YM_INITIAL_VOLUME. The last write
+     * selects R10, so the real latch is known to be 10 before sample slot 0.
+     */
+    memset(state, 0xff, sizeof(*state));
+    state->reg[6] = (uint8_t)YM_INITIAL_NOISE_PERIOD;
+    state->reg[7] = (uint8_t)YM_INITIAL_MIXER;
+    state->reg[8] = (uint8_t)YM_INITIAL_VOLUME;
+    state->reg[9] = (uint8_t)YM_INITIAL_VOLUME;
+    state->reg[10] = (uint8_t)YM_INITIAL_VOLUME;
+    state->latch = (uint8_t)YM_INITIAL_LATCH;
 }
