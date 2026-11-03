@@ -4,7 +4,7 @@
     Final STE YM2149 scheduler.
 
     Converts YM states into
-    fixed 182-cycle slots.
+    fixed 184-cycle slots.
 
 */
 
@@ -14,8 +14,6 @@
 #include "scheduler.h"
 
 
-#define YM_SELECT_COST 20
-#define YM_WRITE_COST  20
 
 
 static const uint8_t order[] =
@@ -26,6 +24,9 @@ static const uint8_t order[] =
     9,
     10
 };
+
+_Static_assert(sizeof(order) / sizeof(order[0]) <= MAX_OPERATIONS,
+               "slot storage must hold every scheduled register");
 
 
 static uint8_t get_register(const YMState *s, const uint8_t r)
@@ -59,18 +60,19 @@ static void add_operation(SampleSlot *const slot, const uint8_t reg, const uint8
 
 
 /* Estimate the 68000 instruction cycles for this operation sequence. */
-static uint16_t calculate_cycles(SampleSlot *const slot)
+static uint8_t calculate_cycles(SampleSlot *const slot)
 {
-    uint16_t cycles = 0;
+    uint8_t cycles = 0;
     uint8_t latch = slot->initial_latch;
 
     for (uint8_t i = 0; i < slot->count; ++i) {
         if (latch != slot->op[i].reg) {
-            cycles += YM_SELECT_COST;
+            cycles += YM_REGISTER_ACCESS_CYCLES;
             latch = slot->op[i].reg;
         }
 
-        cycles += YM_WRITE_COST;
+        cycles = (uint8_t)(cycles + (slot->op[i].reg == 7
+            ? YM_MIXER_WRITE_CYCLES : YM_REGISTER_ACCESS_CYCLES));
     }
 
     slot->final_latch = latch;
@@ -81,7 +83,7 @@ static uint16_t calculate_cycles(SampleSlot *const slot)
 
 
 /* Create a raw slot from YM state. */
-uint16_t scheduler_make_slot(const SchedulerState *state, const YMState *state_in, SampleSlot *const slot)
+uint8_t scheduler_make_slot(const SchedulerState *state, const YMState *state_in, SampleSlot *const slot)
 {
     if (state == NULL || state_in == NULL || slot == NULL)
         return SAMPLE_CYCLES + 1;
@@ -98,27 +100,26 @@ uint16_t scheduler_make_slot(const SchedulerState *state, const YMState *state_i
 
 
 /* Score alternative candidate. */
-static float candidate_score(const Candidate *candidate, const uint16_t cycles)
+static float candidate_score(const Candidate *candidate, const uint8_t cycles)
 {
-    (void)cycles;
-    return candidate->audio_error * 100000.0f + candidate->cycle_cost;
+    return candidate->audio_error * 100000.0f + cycles;
 }
 
 
 /* Feedback search. */
-uint16_t scheduler_make_slot_feedback(const SchedulerState *state, const Candidate *candidates, const uint8_t candidate_count, YMState *const chosen, SampleSlot *const slot)
+uint8_t scheduler_make_slot_feedback(const SchedulerState *state, const Candidate *candidates, const uint8_t candidate_count, YMState *const chosen, SampleSlot *const slot)
 {
     if (state == NULL || candidates == NULL || candidate_count == 0 ||
         chosen == NULL || slot == NULL)
         return SAMPLE_CYCLES + 1;
 
     float best = INFINITY;
-    uint16_t best_index = UINT16_MAX;
+    uint8_t best_index = UINT8_MAX;
     SampleSlot best_slot;
 
-    for (uint16_t i = 0; i < candidate_count; ++i) {
+    for (uint8_t i = 0; i < candidate_count; ++i) {
         SampleSlot test;
-        const uint16_t cycles = scheduler_make_slot(state, &candidates[i].state, &test);
+        const uint8_t cycles = scheduler_make_slot(state, &candidates[i].state, &test);
         if (cycles > MAX_SLOT_OPERATION_CYCLES)
             continue;
 
@@ -130,7 +131,7 @@ uint16_t scheduler_make_slot_feedback(const SchedulerState *state, const Candida
         }
     }
 
-    if (best_index == UINT16_MAX)
+    if (best_index == UINT8_MAX)
         return SAMPLE_CYCLES + 1;
 
     *chosen = candidates[best_index].state;

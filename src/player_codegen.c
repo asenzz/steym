@@ -5,55 +5,62 @@
     Each slot is padded to the configured cycle count.
 */
 
-#include <stddef.h>
+#include <inttypes.h>
 #include <stdio.h>
 
 #include "player_codegen.h"
 
-#define YM_SELECT "$ff8800"
-#define YM_DATA   "$ff8802"
+#define YM_SELECT "($ffff8800).w"
+#define YM_DATA   "($ffff8802).w"
 
-/* These are estimates for the emitted 68000 memory-write instructions. */
-#define MOVE_BYTE_CYCLES 20
-#define NOP_CYCLES        4
-#define DELAY_CYCLES SLOT_PADDING_CYCLES /* moveq #1,d0 (4) + taken dbra (10) */
+/* Atari ST estimates include the PSG wait state for every write. */
+#define NOP_CYCLES 4u
 
 static void emit_select(FILE *const out, const uint8_t reg)
 {
     (void)fprintf(out, "\tmove.b #%u,%s\n", (unsigned)reg, YM_SELECT);
 }
 
-static void emit_data(FILE *const out, const uint8_t value)
+static void emit_data(FILE *const out, const uint8_t reg, const uint8_t value)
 {
-    (void)fprintf(out, "\tmove.b #%u,%s\n", (unsigned)value, YM_DATA);
+    if (reg == 7) {
+        /* Preserve the caller's I/O-port directions held in D1. */
+        (void)fprintf(out,
+            "\tmoveq #%u,d0\n\tor.b d1,d0\n\tmove.b d0,%s\n",
+            (unsigned)(value & 0x3fu), YM_DATA);
+    } else {
+        (void)fprintf(out, "\tmove.b #%u,%s\n", (unsigned)value, YM_DATA);
+    }
 }
 
 static void emit_initial_state(FILE *const out)
 {
-    /* Keep these values synchronized with scheduler_init() in scheduler.c. */
+    /* Save R7's I/O directions before programming any audio mixer bits. */
     (void)fprintf(out,
         "\n; Initialize the YM registers before timed playback slots\n"
-        "\tmove.b #7,%s\n\tmove.b #%u,%s\n"
-        "\tmove.b #6,%s\n\tmove.b #%u,%s\n"
-        "\tmove.b #8,%s\n\tmove.b #%u,%s\n"
-        "\tmove.b #9,%s\n\tmove.b #%u,%s\n"
-        "\tmove.b #10,%s\n\tmove.b #%u,%s\n",
-        YM_SELECT, (unsigned)YM_INITIAL_MIXER, YM_DATA,
-        YM_SELECT, (unsigned)YM_INITIAL_NOISE_PERIOD, YM_DATA,
-        YM_SELECT, (unsigned)YM_INITIAL_VOLUME, YM_DATA,
-        YM_SELECT, (unsigned)YM_INITIAL_VOLUME, YM_DATA,
-        YM_SELECT, (unsigned)YM_INITIAL_VOLUME, YM_DATA);
+        "\tmove.b #7,%s\n\tmoveq #0,d1\n"
+        "\tmove.b %s,d1\n\tandi.b #$c0,d1\n",
+        YM_SELECT, YM_SELECT);
+    emit_data(out, 7, YM_INITIAL_MIXER);
+    emit_select(out, 6);
+    emit_data(out, 6, YM_INITIAL_NOISE_PERIOD);
+    emit_select(out, 8);
+    emit_data(out, 8, YM_INITIAL_VOLUME);
+    emit_select(out, 9);
+    emit_data(out, 9, YM_INITIAL_VOLUME);
+    emit_select(out, 10);
+    emit_data(out, 10, YM_INITIAL_VOLUME);
 }
 
-static int emit_slot(FILE *const out, const SampleSlot *const slot,
-                     const size_t index)
+static int8_t emit_slot(FILE *const out, const SampleSlot *const slot,
+                     const uint32_t index)
 {
-    int cycles = 0;
-    int latch = slot->initial_latch;
+    uint8_t cycles = 0;
+    uint8_t latch = slot->initial_latch;
 
     (void)fprintf(out, "\n;--------------------------------\n");
-    (void)fprintf(out, "; sample slot %zu\n", index);
-    (void)fprintf(out, "; input latch = %d\n", latch);
+    (void)fprintf(out, "; sample slot %" PRIu32 "\n", index);
+    (void)fprintf(out, "; input latch = %u\n", (unsigned)latch);
 
     for (uint8_t i = 0; i < slot->count; ++i) {
         const YMOperation *const op = &slot->op[i];
@@ -62,31 +69,25 @@ static int emit_slot(FILE *const out, const SampleSlot *const slot,
 
         if (latch != op->reg) {
             emit_select(out, op->reg);
-            cycles += MOVE_BYTE_CYCLES;
+            cycles += YM_REGISTER_ACCESS_CYCLES;
             latch = op->reg;
         }
 
-        emit_data(out, op->value);
-        cycles += MOVE_BYTE_CYCLES;
+        emit_data(out, op->reg, op->value);
+        cycles = (uint8_t)(cycles + (op->reg == 7
+            ? YM_MIXER_WRITE_CYCLES : YM_REGISTER_ACCESS_CYCLES));
     }
 
     if (cycles != slot->cycles || latch != slot->final_latch) {
         (void)fprintf(stderr,
-                      "player_codegen: slot %zu disagrees with scheduler metadata\n",
+                      "player_codegen: slot %" PRIu32 " disagrees with scheduler metadata\n",
                       index);
         return -1;
     }
 
-    /* The scheduler guarantees room for the 14-cycle delay plus NOP padding. */
-    if (cycles + DELAY_CYCLES > SAMPLE_CYCLES)
+    /* All writes and NOPs take multiples of four cycles in ST RAM. */
+    if (cycles > SAMPLE_CYCLES)
         return -1;
-
-    /* D0 is caller-saved. The taken DBRA skips the NOP and costs 10 cycles. */
-    (void)fprintf(out, "\tmoveq #1,d0\n");
-    (void)fprintf(out, "\tdbra d0,steYm_pad_end_%zu\n", index);
-    (void)fprintf(out, "\tnop\n");
-    (void)fprintf(out, "steYm_pad_end_%zu:\n", index);
-    cycles += DELAY_CYCLES;
 
     while (cycles + NOP_CYCLES <= SAMPLE_CYCLES) {
         (void)fprintf(out, "\tnop\n");
@@ -94,16 +95,16 @@ static int emit_slot(FILE *const out, const SampleSlot *const slot,
     }
 
     if (cycles != SAMPLE_CYCLES) {
-        (void)fprintf(stderr, "player_codegen: slot %zu cannot be padded to %u cycles\n",
+        (void)fprintf(stderr, "player_codegen: slot %" PRIu32 " cannot be padded to %u cycles\n",
                       index, (unsigned)SAMPLE_CYCLES);
         return -1;
     }
 
-    (void)fprintf(out, "; estimated cycles=%d\n", cycles);
+    (void)fprintf(out, "; estimated cycles=%u\n", (unsigned)cycles);
     return ferror(out) ? -1 : 0;
 }
 
-int player_codegen_generate(FILE *const out, const ScheduledStream *const stream)
+int8_t player_codegen_generate(FILE *const out, const ScheduledStream *const stream)
 {
     if (out == NULL || stream == NULL ||
         (stream->count != 0 && stream->slots == NULL))
@@ -114,6 +115,8 @@ int player_codegen_generate(FILE *const out, const ScheduledStream *const stream
         "; Atari STE YM2149 generated player\n"
         "; Nominal %u-cycle slots (instruction timing is estimated)\n"
         "; Entry point: ym_player; returns with RTS\n"
+        "; Requires supervisor mode, masked interrupts, exclusive YM/bus access\n"
+        "; Clobbers D0/D1 and condition codes; mutes R8-R10 on return\n"
         ";=================================================\n\n"
         "\tsection text\n\n"
         "ym_player:\n",
@@ -121,7 +124,7 @@ int player_codegen_generate(FILE *const out, const ScheduledStream *const stream
 
     emit_initial_state(out);
 
-    for (size_t i = 0; i < stream->count; ++i) {
+    for (uint32_t i = 0; i < stream->count; ++i) {
         const SampleSlot *const slot = &stream->slots[i];
 
         if (slot->count > MAX_OPERATIONS ||
@@ -134,13 +137,18 @@ int player_codegen_generate(FILE *const out, const ScheduledStream *const stream
         }
         if (i > 0 && slot->initial_latch != stream->slots[i - 1].final_latch) {
             (void)fprintf(stderr,
-                          "player_codegen: latch discontinuity at slot %zu\n", i);
+                          "player_codegen: latch discontinuity at slot %" PRIu32 "\n", i);
             return -1;
         }
         if (emit_slot(out, slot, i) != 0)
             return -1;
     }
 
-    (void)fprintf(out, "\n\trts\n");
+    (void)fprintf(out,
+        "\n; Silence all channels after the last complete sample slot\n"
+        "\tmove.b #8,%s\n\tmove.b #0,%s\n"
+        "\tmove.b #9,%s\n\tmove.b #0,%s\n"
+        "\tmove.b #10,%s\n\tmove.b #0,%s\n\trts\n",
+        YM_SELECT, YM_DATA, YM_SELECT, YM_DATA, YM_SELECT, YM_DATA);
     return ferror(out) ? -1 : 0;
 }

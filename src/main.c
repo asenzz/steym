@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include "optimizer.h"
 #include "viterbi.h"
@@ -74,10 +75,10 @@ static int16_t *load_pcm(const char *filename, size_t *const samples)
     for (size_t i = 0; i < count; ++i) {
         const uint16_t bits = (uint16_t)bytes[2 * i] |
                               (uint16_t)((uint16_t)bytes[2 * i + 1] << 8);
-        const int32_t signed_value = (bits & UINT16_C(0x8000))
-            ? (int32_t)bits - INT32_C(65536)
-            : (int32_t)bits;
-        data[i] = (int16_t)signed_value;
+        const int16_t signed_value = (bits & UINT16_C(0x8000))
+            ? (int16_t)((int32_t)bits - INT32_C(65536))
+            : (int16_t)bits;
+        data[i] = signed_value;
     }
 
     *samples = count;
@@ -123,7 +124,7 @@ static ScheduledStream *schedule_states(const YMState *states, const size_t coun
     SchedulerState scheduler;
     scheduler_init(&scheduler);
 
-    for (size_t i = 0; i < count; ++i) {
+    for (uint32_t i = 0; i < count; ++i) {
         /*
          * Current Viterbi API exposes only one state per sample.
          * Wrap it as a single candidate so it passes through the
@@ -133,7 +134,7 @@ static ScheduledStream *schedule_states(const YMState *states, const size_t coun
 
         YMState chosen;
         SampleSlot slot;
-        const uint16_t cycles = scheduler_make_slot_feedback(
+        const uint8_t cycles = scheduler_make_slot_feedback(
             &scheduler, &candidate, 1, &chosen, &slot);
 
         /*
@@ -143,7 +144,7 @@ static ScheduledStream *schedule_states(const YMState *states, const size_t coun
         if (cycles > MAX_SLOT_OPERATION_CYCLES) {
             fprintf(stderr,
                     "error: no cycle-feasible slot at sample %zu; operation limit is %u cycles\n",
-                    i, (unsigned)MAX_SLOT_OPERATION_CYCLES);
+                    (size_t)i, (unsigned)MAX_SLOT_OPERATION_CYCLES);
             free(stream->slots);
             free(stream);
             return NULL;
@@ -203,7 +204,7 @@ int main(int argc, char **argv)
         return 2;
     }
     free(pcm);
-    printf("Scheduling 182-cycle slots...\n");
+    printf("Scheduling %u-cycle slots...\n", (unsigned)SAMPLE_CYCLES);
 
     ScheduledStream *stream = schedule_states(states, count);
     free(states);
@@ -221,9 +222,9 @@ int main(int argc, char **argv)
     }
 
     printf("Generating Devpac source...\n");
-    const int generation_error = player_codegen_generate(out, stream);
-    const int output_error = ferror(out);
-    const int close_error = fclose(out);
+    const int8_t generation_error = player_codegen_generate(out, stream);
+    const bool output_error = ferror(out) != 0;
+    const bool close_error = fclose(out) != 0;
     if (generation_error != 0 || output_error || close_error != 0) {
         perror(output);
         free(stream->slots);

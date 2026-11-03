@@ -12,16 +12,11 @@ typedef struct
 {
     YMState ym;
 
-    /* Register shadow and actual YM latch for this search path. */
-    SchedulerState scheduler;
-
-    /* Noise sigma-delta state. */
-
+    /* Keep floating-point fields together, then byte-sized path metadata. */
     float noise_error;
-
     float cost;
-
-    int previous;
+    SchedulerState scheduler;
+    int8_t previous;
 
 } ViterbiNode;
 
@@ -37,7 +32,7 @@ typedef struct
 
 /* Returns 0 on success and -1 on invalid input, allocation failure,
    or when no cycle-feasible path can be found. */
-int viterbi_optimize(const float *pcm, size_t samples, YMState *output);
+int8_t viterbi_optimize(const float *pcm, size_t samples, YMState *output);
 
 
 #endif

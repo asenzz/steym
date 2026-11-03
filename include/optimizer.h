@@ -2,6 +2,7 @@
 #define STE_YM_OPTIMIZER_H
 
 
+#include <stdbool.h>
 #include <stdint.h>
 
 
@@ -39,13 +40,17 @@ typedef struct
     float audio_error;
 
     /* Estimated 68000/YM bus cost. */
-    uint16_t cycle_cost;
+    uint8_t cycle_cost;
 
     /* Combined optimization metric. */
     float total_cost;
 } Candidate;
 
-#define MAX_CANDIDATES 255
+/* 125 local states + 16 DAC anchors + 1 noise-off + 3 noise-on. */
+#define MAX_CANDIDATES 145
+
+_Static_assert(MAX_CANDIDATES <= UINT8_MAX, "candidate count must fit uint8_t");
+_Static_assert(MAX_CANDIDATES - 1 <= INT16_MAX, "candidate index must fit int16_t");
 
 /* Optimizer state. */
 typedef struct
@@ -72,18 +77,18 @@ void optimizer_generate_candidates(Optimizer *opt, float target);
 /* Generate candidates including YM noise dithering. */
 void optimizer_generate_candidates_noise(Optimizer *opt, float target, SigmaDeltaState *sd);
 
-uint16_t optimizer_transition_cost(const YMState *old, const YMState *next);
+uint8_t optimizer_transition_cost(const YMState *old, const YMState *next);
 
 /* Existing optimizer helpers. */
-int optimizer_best_candidate(Optimizer *opt);
+int16_t optimizer_best_candidate(Optimizer *opt);
 void optimizer_commit(Optimizer *opt, const YMState *state);
 
 /* Maximum output amplitude supported by the YM output model. */
 float optimizer_output_max(void);
 
-int optimizer_update_sigma_delta(SigmaDeltaState *sd, float input, float output);
+bool optimizer_update_sigma_delta(SigmaDeltaState *sd, float input, float output);
 
-int pcm_to_quantizer_target(
+bool pcm_to_quantizer_target(
     const float pcm,
     float *const target);
 

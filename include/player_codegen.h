@@ -7,7 +7,7 @@
 
 
 /* Returns 0 on success and -1 if the stream is invalid or output fails. */
-int player_codegen_generate(FILE *out, const ScheduledStream *stream);
+int8_t player_codegen_generate(FILE *out, const ScheduledStream *stream);
 
 
 #endif

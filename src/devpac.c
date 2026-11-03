@@ -20,8 +20,8 @@ void devpac_generate(FILE *const out, const YMState *const states, const int cou
         return;
     }
 
-    const size_t sample_count = (size_t)count;
-    if (sample_count > SIZE_MAX / sizeof(SampleSlot)) {
+    const uint32_t sample_count = (uint32_t)count;
+    if (sizeof(SampleSlot) > SIZE_MAX / sample_count) {
         (void)fprintf(stderr, "devpac_generate: sample count is too large\n");
         return;
     }
@@ -36,13 +36,13 @@ void devpac_generate(FILE *const out, const YMState *const states, const int cou
     SchedulerState scheduler;
     scheduler_init(&scheduler);
 
-    for (size_t i = 0; i < sample_count; ++i) {
+    for (uint32_t i = 0; i < sample_count; ++i) {
         SampleSlot slot;
-        const uint16_t cycles = scheduler_make_slot(&scheduler, &states[i], &slot);
+        const uint8_t cycles = scheduler_make_slot(&scheduler, &states[i], &slot);
 
         if (cycles > MAX_SLOT_OPERATION_CYCLES) {
             (void)fprintf(stderr,
-                          "devpac_generate: sample %zu exceeds the cycle budget\n", i);
+                          "devpac_generate: sample %zu exceeds the cycle budget\n", (size_t)i);
             free(stream.slots);
             return;
         }
