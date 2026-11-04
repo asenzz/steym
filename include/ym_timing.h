@@ -7,9 +7,8 @@
 /* MOVEQ + OR.B + data-register store: 4 + 4 + 12 + 4 wait. */
 #define YM_MIXER_WRITE_CYCLES 24u
 
-/* Code in Atari ST RAM uses 4-cycle bus alignment; pad only with NOPs. */
-#define SAMPLE_CYCLES 184u
-#define SLOT_PADDING_CYCLES 0u
-#define MAX_SLOT_OPERATION_CYCLES (SAMPLE_CYCLES - SLOT_PADDING_CYCLES)
+/* Alternate 180/184-cycle slots for a 182-cycle average. */
+#define SAMPLE_CYCLES 182u
+#define MAX_SLOT_OPERATION_CYCLES (SAMPLE_CYCLES - 2u)
 
 #endif

@@ -85,19 +85,11 @@ static int8_t emit_slot(FILE *const out, const SampleSlot *const slot,
         return -1;
     }
 
-    /* All writes and NOPs take multiples of four cycles in ST RAM. */
-    if (cycles > SAMPLE_CYCLES)
-        return -1;
-
-    while (cycles + NOP_CYCLES <= SAMPLE_CYCLES) {
-        (void)fprintf(out, "\tnop\n");
+    /* ST RAM bus timing and NOP padding use four-cycle steps. */
+    const unsigned slot_cycles = MAX_SLOT_OPERATION_CYCLES + (index % 2u) * NOP_CYCLES;
+    while (cycles < slot_cycles) {
+        (void)fputs("\tnop\n", out);
         cycles += NOP_CYCLES;
-    }
-
-    if (cycles != SAMPLE_CYCLES) {
-        (void)fprintf(stderr, "player_codegen: slot %" PRIu32 " cannot be padded to %u cycles\n",
-                      index, (unsigned)SAMPLE_CYCLES);
-        return -1;
     }
 
     (void)fprintf(out, "; estimated cycles=%u\n", (unsigned)cycles);
@@ -113,7 +105,7 @@ int8_t player_codegen_generate(FILE *const out, const ScheduledStream *const str
     (void)fprintf(out,
         ";=================================================\n"
         "; Atari STE YM2149 generated player\n"
-        "; Nominal %u-cycle slots (instruction timing is estimated)\n"
+        "; Average %u cycles per slot (instruction timing is estimated)\n"
         "; Entry point: ym_player; returns with RTS\n"
         "; Requires supervisor mode, masked interrupts, exclusive YM/bus access\n"
         "; Clobbers D0/D1 and condition codes; mutes R8-R10 on return\n"

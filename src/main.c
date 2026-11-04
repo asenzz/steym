@@ -204,7 +204,7 @@ int main(int argc, char **argv)
         return 2;
     }
     free(pcm);
-    printf("Scheduling %u-cycle slots...\n", (unsigned)SAMPLE_CYCLES);
+    printf("Scheduling slots averaging %u cycles...\n", (unsigned)SAMPLE_CYCLES);
 
     ScheduledStream *stream = schedule_states(states, count);
     free(states);

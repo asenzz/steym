@@ -39,12 +39,12 @@ directions are preserved, and R8-R10 are silenced on return.
 Calling `ym_player` directly requires the same supervisor/interrupt/ownership
 conditions to be established by the caller.
 
-The player now uses nominal 184-cycle slots. At an assumed 8 MHz CPU clock this
-is approximately 43,478 samples/second. Raw PCM has no sample-rate metadata, so
-prepare input at the intended playback rate. The generator forces absolute-short
-PSG addresses and models their wait states; slots use NOP-only padding to avoid
-the former DBRA/RAM alignment problem. These are timing estimates that still
-require assembly and verification in an Atari STE emulator and on hardware.
+The player alternates 180- and 184-cycle slots for an average of 182 CPU
+cycles per sample, or about 44,073 Hz at the nominal PAL STE clock of
+8,021,247 Hz. Raw PCM has no rate metadata. Use 44,073 Hz input to match
+playback, or 44,100 Hz input for about 0.06% slower playback. The generator
+uses absolute-short PSG addresses, models their wait states, and pads slots
+with NOPs. Actual timing still needs emulator or hardware verification.
 
 The optimizer keeps its local volume refinement and adds DAC anchors across the
 full range, so full/zero transitions need not ramp by two volume steps per slot.
@@ -54,13 +54,13 @@ or the intermediate levels while several registers are written within a slot.
 
 Memory limitations remain significant. Compact backtracking stores only states,
 byte-sized predecessors and a byte-sized beam count. On the tested x86-64 ABI,
-this is 836 bytes/sample instead of the former 2,820, about 34.7 MiB per second
-at 43,478 Hz, before other buffers. The tested GCC m68k ABI uses 706 bytes/sample;
+this is 836 bytes/sample instead of the former 2,820, about 35.1 MiB per second
+at 44,073 Hz, before other buffers. The tested GCC m68k ABI uses 706 bytes/sample;
 actual sizes depend on the toolchain ABI. Thus normal clips still
 do not fit when running the compiler on a 4 MiB STE; checkpoint/replay or another
 bounded-memory search design is needed. Software floating point and the beam
 search also make this an offline compiler, with no real-time conversion claim.
 
-The player is unrolled: an empty 184-cycle slot occupies 92 bytes of 68000 code,
+The player is unrolled: an empty slot occupies 90 or 92 bytes of 68000 code,
 about 3.8 MiB/second at the assumed rate, before startup, cleanup and the host
 program. A compact data stream with a looping player requires a separate design.
