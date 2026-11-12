@@ -52,12 +52,12 @@ Noise gating can be disabled again. The YM amplitude curve and noise model are
 approximations; they do not simulate the actual noise waveform, analog mixing,
 or the intermediate levels while several registers are written within a slot.
 
-Memory limitations remain significant. Compact backtracking stores only states,
-byte-sized predecessors and a byte-sized beam count. On the tested x86-64 ABI,
-this is 836 bytes/sample instead of the former 2,820, about 35.1 MiB per second
-at 44,073 Hz, before other buffers. The tested GCC m68k ABI uses 706 bytes/sample;
-actual sizes depend on the toolchain ABI. Thus normal clips still
-do not fit when running the compiler on a 4 MiB STE; checkpoint/replay or another
+Memory limitations remain significant. Compact backtracking stores six register
+and latch bytes plus one byte-sized predecessor per beam node, and a byte-sized
+beam count: 449 bytes/sample on the tested native and m68k ABIs, about 18.9 MiB
+per second at 44,073 Hz, before other buffers. Amplitudes are reconstructed only
+for the chosen path with the same output model used during search. Normal clips
+still do not fit when running the compiler on a 4 MiB STE; checkpoint/replay or another
 bounded-memory search design is needed. Software floating point and the beam
 search also make this an offline compiler, with no real-time conversion claim.
 

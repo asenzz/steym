@@ -1,0 +1,12 @@
+# Version control
+.git/
+
+# Build artifacts & binaries
+build/
+*.o
+*.a
+steymc
+*.so
+*.exe
+
+.idea/editor.xml

@@ -64,6 +64,7 @@ uint8_t scheduler_make_slot_feedback(
     YMState *chosen,
     SampleSlot *slot);
 
+/* Caller provides storage for at least stream->count + 1 slots. */
 void scheduler_append_slot(ScheduledStream *stream, const SampleSlot *slot);
 
 void scheduler_commit_slot(SchedulerState *scheduler, const SampleSlot *slot);

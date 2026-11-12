@@ -125,17 +125,8 @@ static ScheduledStream *schedule_states(const YMState *states, const size_t coun
     scheduler_init(&scheduler);
 
     for (uint32_t i = 0; i < count; ++i) {
-        /*
-         * Current Viterbi API exposes only one state per sample.
-         * Wrap it as a single candidate so it passes through the
-         * same scheduler-feedback and validation interface.
-         */
-        const Candidate candidate = { .state = states[i], .audio_error = 0.f, .cycle_cost = 0, .total_cost = 0.f };
-
-        YMState chosen;
         SampleSlot slot;
-        const uint8_t cycles = scheduler_make_slot_feedback(
-            &scheduler, &candidate, 1, &chosen, &slot);
+        const uint8_t cycles = scheduler_make_slot(&scheduler, &states[i], &slot);
 
         /*
          * Reject infeasible slots. Do not append them and do not
@@ -189,7 +180,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    YMState *const states = calloc(count, sizeof(YMState));
+    YMState *const states = malloc(count * sizeof(*states));
     if (states == NULL) {
         perror("states");
         free(pcm);

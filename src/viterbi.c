@@ -16,40 +16,35 @@
 #define FUTURE_WEIGHT 50000.0f
 #define NOISE_WEIGHT  20000.0f
 
-static float absf_fast(const float x)
-{
-    return x < 0.0f ? -x : x;
-}
 
 /* Full transition cost, including the scheduler's modeled cycle count. */
 static float transition_cost(
-    const ViterbiNode *old,
-    const Candidate *candidate,
-    const float current_target,
+    const Candidate *const candidate,
     const float next_target,
+    const float noise_cost,
     const uint8_t cycles)
 {
-    float decision_target = current_target + old->noise_error;
-    const float full_scale = optimizer_output_max();
-    if (decision_target < 0.0f)
-        decision_target = 0.0f;
-    else if (decision_target > full_scale)
-        decision_target = full_scale;
-
-    float cost = absf_fast(decision_target - candidate->state.amplitude)
-                 * AUDIO_WEIGHT;
-    cost += absf_fast(next_target - candidate->state.amplitude)
+    float cost = candidate->audio_error * AUDIO_WEIGHT;
+    cost += fabsf(next_target - candidate->state.amplitude)
             * FUTURE_WEIGHT;
     cost += (float)cycles;
-    cost += absf_fast(old->noise_error) * NOISE_WEIGHT;
+    cost += noise_cost;
     return cost;
 }
 
-/* Backtracking needs only the emitted state and predecessor, not search costs,
-   feedback accumulators or register shadows. */
+/* Retain only register values and predecessors. Recompute the derived amplitude
+   once per output sample instead of storing it for every retained beam node. */
 typedef struct
 {
-    YMState ym[BEAM_WIDTH];
+    uint8_t mixer;
+    uint8_t volume[3];
+    uint8_t noise_period;
+    int8_t selected_register;
+} ViterbiTraceState;
+
+typedef struct
+{
+    ViterbiTraceState ym[BEAM_WIDTH];
     int8_t previous[BEAM_WIDTH];
     uint8_t count;
 } ViterbiTrace;
@@ -112,7 +107,7 @@ int8_t viterbi_optimize(const float *const pcm, const size_t samples,
     history = malloc(samples * sizeof(*history));
     optimizer = malloc(sizeof(*optimizer));
     current = calloc(1, sizeof(*current));
-    next = malloc(sizeof(*next));
+    next = calloc(1, sizeof(*next));
     if (history == NULL || optimizer == NULL || current == NULL || next == NULL) {
         fprintf(stderr, "viterbi_optimize: allocation failed for %zu samples.\n", samples);
         goto cleanup;
@@ -124,20 +119,29 @@ int8_t viterbi_optimize(const float *const pcm, const size_t samples,
     current->node[0].ym = optimizer->current;
     scheduler_init(&current->node[0].scheduler);
     current->node[0].ym.selected_register =
-        (int8_t)current->node[0].scheduler.latch;
+        current->node[0].scheduler.latch == UINT8_MAX
+            ? -1
+            : (int8_t)current->node[0].scheduler.latch;
     current->node[0].noise_error = 0.0f;
     current->node[0].cost = 0.0f;
     current->node[0].previous = -1;
 
-    for (size_t n = 0; n < samples; ++n) {
-        float target;
-        float next_target;
+    float target = 0.0f;
+    float next_target = 0.0f;
+    if (!pcm_to_quantizer_target(pcm[0], &target) || !isfinite(target)) {
+        fprintf(stderr, "viterbi_optimize: invalid PCM value at sample 0.\n");
+        goto cleanup;
+    }
 
-        if (!pcm_to_quantizer_target(pcm[n], &target) ||
-            !pcm_to_quantizer_target(pcm[n + 1 < samples ? n + 1 : n],
-                                     &next_target)) {
-            fprintf(stderr, "viterbi_optimize: invalid PCM value at sample %zu.\n", n);
-            goto cleanup;
+    for (size_t n = 0; n < samples; ++n) {
+        if (n + 1 < samples) {
+            if (!pcm_to_quantizer_target(pcm[n + 1], &next_target) ||
+                !isfinite(next_target)) {
+                fprintf(stderr, "viterbi_optimize: invalid PCM value at sample %zu.\n", n + 1);
+                goto cleanup;
+            }
+        } else {
+            next_target = target;
         }
 
         next->count = 0;
@@ -148,6 +152,7 @@ int8_t viterbi_optimize(const float *const pcm, const size_t samples,
             if (!isfinite(parent->noise_error) || !isfinite(parent->cost))
                 continue;
 
+            const float noise_cost = fabsf(parent->noise_error) * NOISE_WEIGHT;
             optimizer->current = parent->ym;
 
             /* Candidate generation receives this path's feedback residual. */
@@ -168,35 +173,34 @@ int8_t viterbi_optimize(const float *const pcm, const size_t samples,
                 if (cycles > MAX_SLOT_OPERATION_CYCLES)
                     continue;
 
-                SchedulerState next_scheduler = parent->scheduler;
-                scheduler_commit_slot(&next_scheduler, &slot);
+                const float step_cost = transition_cost(
+                    candidate, next_target, noise_cost, cycles);
+                const float total_cost = parent->cost + step_cost;
+                if (!isfinite(step_cost) || step_cost < 0.0f ||
+                    !isfinite(total_cost) ||
+                    (next->count == BEAM_WIDTH &&
+                     total_cost >= next->node[BEAM_WIDTH - 1].cost))
+                    continue;
 
-                /* Every child has its own feedback accumulator. */
+                /* Only surviving children need feedback and register shadows. */
                 SigmaDeltaState child_sd = { .error = parent->noise_error };
                 if (!optimizer_update_sigma_delta(
                         &child_sd, target, candidate->state.amplitude))
                     continue;
 
-                ViterbiNode node = {0};
-                node.ym = candidate->state;
-                node.scheduler = next_scheduler;
+                SchedulerState next_scheduler = parent->scheduler;
+                scheduler_commit_slot(&next_scheduler, &slot);
+
+                ViterbiNode node = {
+                    .ym = candidate->state,
+                    .noise_error = child_sd.error,
+                    .cost = total_cost,
+                    .scheduler = next_scheduler,
+                    .previous = (int8_t)b
+                };
                 node.ym.selected_register = next_scheduler.latch == UINT8_MAX
                     ? -1
                     : (int8_t)next_scheduler.latch;
-                node.noise_error = child_sd.error;
-                node.previous = (int8_t)b;
-
-                const float step_cost = transition_cost(
-                    parent, candidate, target, next_target, cycles);
-                const float total_cost = parent->cost + step_cost;
-
-                if (!isfinite(step_cost) || step_cost < 0.0f ||
-                    !isfinite(total_cost))
-                    continue;
-
-                node.cost = total_cost;
-                if (!isfinite(node.cost))
-                    continue;
 
                 beam_insert(next, &node);
             }
@@ -213,6 +217,8 @@ int8_t viterbi_optimize(const float *const pcm, const size_t samples,
         const float base_cost = next->node[0].cost;
         for (uint8_t i = 0; i < next->count; ++i) {
             next->node[i].cost -= base_cost;
+            if (next->node[i].cost < 0)
+                next->node[i].cost = 0;
             if (!isfinite(next->node[i].cost)) {
                 fprintf(stderr, "viterbi_optimize: non-finite beam cost at sample %zu.\n", n);
                 goto cleanup;
@@ -221,12 +227,19 @@ int8_t viterbi_optimize(const float *const pcm, const size_t samples,
 
         history[n].count = next->count;
         for (uint8_t i = 0; i < next->count; ++i) {
-            history[n].ym[i] = next->node[i].ym;
+            const YMState *const ym = &next->node[i].ym;
+            history[n].ym[i] = (ViterbiTraceState){
+                .mixer = ym->mixer,
+                .volume = { ym->volume[0], ym->volume[1], ym->volume[2] },
+                .noise_period = ym->noise_period,
+                .selected_register = ym->selected_register
+            };
             history[n].previous[i] = next->node[i].previous;
         }
         ViterbiBeam *const temp = current;
         current = next;
         next = temp;
+        target = next_target;
     }
 
     if (current->count == 0)
@@ -240,7 +253,15 @@ int8_t viterbi_optimize(const float *const pcm, const size_t samples,
             goto cleanup;
         }
 
-        output[t - 1] = trace->ym[best];
+        const ViterbiTraceState *const ym = &trace->ym[best];
+        YMState state = {
+            .mixer = ym->mixer,
+            .volume = { ym->volume[0], ym->volume[1], ym->volume[2] },
+            .noise_period = ym->noise_period,
+            .selected_register = ym->selected_register
+        };
+        state.amplitude = optimizer_state_output(&state);
+        output[t - 1] = state;
         if (t > 1) {
             const int8_t previous = trace->previous[best];
             if (previous < 0 || (uint8_t)previous >= history[t - 2].count) {

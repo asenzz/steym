@@ -4,7 +4,7 @@
     Final STE YM2149 scheduler.
 
     Converts YM states into
-    fixed 184-cycle slots.
+    alternating 180/184-cycle slots.
 
 */
 
@@ -29,73 +29,40 @@ _Static_assert(sizeof(order) / sizeof(order[0]) <= MAX_OPERATIONS,
                "slot storage must hold every scheduled register");
 
 
-static uint8_t get_register(const YMState *s, const uint8_t r)
-{
-    switch(r)
-    {
-        case 6: return s->noise_period;
-
-        case 7: return s->mixer;
-
-        case 8: return s->volume[0];
-
-        case 9: return s->volume[1];
-
-        case 10: return s->volume[2];
-
-        default: return 0;
-    }
-}
-
-
-
-/* Add operation. */
-static void add_operation(SampleSlot *const slot, const uint8_t reg, const uint8_t value)
-{
-    if(slot->count >= MAX_OPERATIONS) return;
-    slot->op[slot->count].reg = reg;
-    slot->op[slot->count].value = value;
-    ++(slot->count);
-}
-
-
-/* Estimate the 68000 instruction cycles for this operation sequence. */
-static uint8_t calculate_cycles(SampleSlot *const slot)
-{
-    uint8_t cycles = 0;
-    uint8_t latch = slot->initial_latch;
-
-    for (uint8_t i = 0; i < slot->count; ++i) {
-        if (latch != slot->op[i].reg) {
-            cycles += YM_REGISTER_ACCESS_CYCLES;
-            latch = slot->op[i].reg;
-        }
-
-        cycles = (uint8_t)(cycles + (slot->op[i].reg == 7
-            ? YM_MIXER_WRITE_CYCLES : YM_REGISTER_ACCESS_CYCLES));
-    }
-
-    slot->final_latch = latch;
-    slot->cycles = cycles;
-
-    return cycles;
-}
-
-
-/* Create a raw slot from YM state. */
+/* Create a raw slot from YM state, preserving the defined register order. */
 uint8_t scheduler_make_slot(const SchedulerState *state, const YMState *state_in, SampleSlot *const slot)
 {
     if (state == NULL || state_in == NULL || slot == NULL)
         return SAMPLE_CYCLES + 1;
 
+    const uint8_t values[] = {
+        state_in->mixer, state_in->noise_period,
+        state_in->volume[0], state_in->volume[1], state_in->volume[2]
+    };
+    _Static_assert(sizeof(values) / sizeof(values[0]) ==
+                   sizeof(order) / sizeof(order[0]),
+                   "each scheduled register needs one value");
+
     memset(slot, 0, sizeof(*slot));
     slot->initial_latch = state->latch;
-    for (uint8_t i = 0; i < sizeof(order); ++i) {
-        const uint8_t r = order[i];
-        const uint8_t value = get_register(state_in, r);
-        if(state->reg[r] != value) add_operation(slot, r, value);
+    uint8_t latch = state->latch;
+    uint8_t cycles = 0;
+    for (uint8_t i = 0; i < sizeof(order) / sizeof(order[0]); ++i) {
+        const uint8_t reg = order[i];
+        if (state->reg[reg] == values[i])
+            continue;
+
+        slot->op[slot->count++] = (YMOperation){ .reg = reg, .value = values[i] };
+        if (latch != reg) {
+            cycles = (uint8_t)(cycles + YM_REGISTER_ACCESS_CYCLES);
+            latch = reg;
+        }
+        cycles = (uint8_t)(cycles + (reg == 7
+            ? YM_MIXER_WRITE_CYCLES : YM_REGISTER_ACCESS_CYCLES));
     }
-    return calculate_cycles(slot);
+    slot->final_latch = latch;
+    slot->cycles = cycles;
+    return cycles;
 }
 
 
@@ -118,6 +85,9 @@ uint8_t scheduler_make_slot_feedback(const SchedulerState *state, const Candidat
     SampleSlot best_slot;
 
     for (uint8_t i = 0; i < candidate_count; ++i) {
+        if (!(candidates[i].audio_error >= 0.0f))
+            continue;
+
         SampleSlot test;
         const uint8_t cycles = scheduler_make_slot(state, &candidates[i].state, &test);
         if (cycles > MAX_SLOT_OPERATION_CYCLES)
@@ -143,12 +113,21 @@ uint8_t scheduler_make_slot_feedback(const SchedulerState *state, const Candidat
 /* Commit emitted slot. The next slot starts with the correct YM latch. */
 void scheduler_commit_slot(SchedulerState *const scheduler, const SampleSlot *slot)
 {
-    if (scheduler == NULL || slot == NULL)
+    if (scheduler == NULL || slot == NULL || slot->count > MAX_OPERATIONS)
         return;
 
-    for(uint8_t i = 0; i < slot->count; ++i)
-        if (slot->op[i].reg < REG_COUNT)
-            scheduler->reg[ slot->op[i].reg ] = slot->op[i].value;
+    /* Validate operations and latch continuity before modifying the shadow. */
+    uint8_t latch = slot->initial_latch;
+    for (uint8_t i = 0; i < slot->count; ++i) {
+        if (slot->op[i].reg >= REG_COUNT)
+            return;
+        latch = slot->op[i].reg;
+    }
+    if (slot->initial_latch != scheduler->latch || latch != slot->final_latch)
+        return;
+
+    for (uint8_t i = 0; i < slot->count; ++i)
+        scheduler->reg[slot->op[i].reg] = slot->op[i].value;
     scheduler->latch = slot->final_latch;
 }
 

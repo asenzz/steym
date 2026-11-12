@@ -13,56 +13,68 @@
 */
 
 
-#include <string.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
 #include "optimizer.h"
 #include "ym_timing.h"
 
 #define YM_REGISTER_COUNT 16
 #define AUDIO_WEIGHT 100000.0f
+#define YM_VOLUME_MAX 0.617000f
+#define YM_FULL_SCALE (3.0f * YM_VOLUME_MAX)
+#define YM_MIXER_DISABLE_TONE_NOISE 0x3FU
+#define YM_MIXER_NOISE_BITS 0x38U
 
-/* Approximate YM2149 logarithmic
-    volume curve.
-    This can later be replaced with
-    a measured STE amplifier curve. */
+/* Approximate logarithmic curve, pre-scaled for 1/4, 1/2 and full duty.
+   Powers of two preserve the former runtime products exactly. */
 
-static const float ym_volume[16] =
-{
-    0.000000f,
-    0.004800f,
-    0.006800f,
-    0.009600f,
-    0.013700f,
-    0.019300f,
-    0.027300f,
-    0.038500f,
-    0.054400f,
-    0.076900f,
-    0.108700f,
-    0.153800f,
-    0.217400f,
-    0.307700f,
-    0.435900f,
-    0.617000f
+#define YM_VOLUME_CURVE(scale) \
+    0.000000f * (scale), 0.004800f * (scale), 0.006800f * (scale), 0.009600f * (scale), \
+    0.013700f * (scale), 0.019300f * (scale), 0.027300f * (scale), 0.038500f * (scale), \
+    0.054400f * (scale), 0.076900f * (scale), 0.108700f * (scale), 0.153800f * (scale), \
+    0.217400f * (scale), 0.307700f * (scale), 0.435900f * (scale), YM_VOLUME_MAX * (scale)
+
+static const float ym_volume[3][16] = {
+    { YM_VOLUME_CURVE(0.25f) },
+    { YM_VOLUME_CURVE(0.5f) },
+    { YM_VOLUME_CURVE(1.0f) }
 };
+
+#undef YM_VOLUME_CURVE
+
+
+static bool volumes_valid(const YMState *const s)
+{
+    return s->volume[0] <= 15u && s->volume[1] <= 15u && s->volume[2] <= 15u;
+}
+
+static float clampf(float value, float min, float max)
+{
+    if (value < min)
+        return min;
+    if (value > max)
+        return max;
+    return value;
+}
 
 
 
 /* Initialize optimizer. */
-
 void optimizer_init(Optimizer *const opt)
 {
     if (opt == NULL)
         return;
 
-    memset( opt, 0, sizeof(*opt));
-    opt->current.volume[0]=0;
-    opt->current.volume[1]=0;
-    opt->current.volume[2]=0;
-    opt->current.mixer=0xff;
-    opt->current.noise_period=1;
-    opt->current.selected_register=-1;
-    opt->current.amplitude=0.0f;
+    memset(opt, 0, sizeof *opt);
+    opt->current = (YMState){
+        .mixer = 0xFFu,
+        .noise_period = 1u,
+        .selected_register = -1
+    };
 }
 
 
@@ -79,70 +91,49 @@ void optimizer_init(Optimizer *const opt)
  * This estimates average output. It does not simulate the actual
  * YM2149 noise sequence or its temporal correlation.
  */
-static float ym_output(const YMState *const state)
+
+float optimizer_state_output(const YMState *const state)
 {
-    float output = 0.0f;
+    const uint8_t m = state->mixer;
 
-    for (uint8_t ch = 0; ch < 3; ++ch) {
-        const float level = ym_volume[state->volume[ch]];
+    const uint8_t idx0 = (uint8_t)((m & 1u) + ((m & 8u) >> 3));
+    const uint8_t idx1 = (uint8_t)(((m & 2u) >> 1) + ((m & 16u) >> 4));
+    const uint8_t idx2 = (uint8_t)(((m & 4u) >> 2) + ((m & 32u) >> 5));
 
-        const bool tone_enabled =
-            (state->mixer & (1u << ch)) == 0;
-
-        const bool noise_enabled =
-            (state->mixer & (1u << (ch + 3u))) == 0;
-
-        float duty = 1.0f;
-
-        if (tone_enabled)
-            duty *= 0.5f;
-
-        if (noise_enabled)
-            duty *= 0.5f;
-
-        output += level * duty;
-    }
-
-    return output;
+    return ym_volume[idx0][state->volume[0]]
+         + ym_volume[idx1][state->volume[1]]
+         + ym_volume[idx2][state->volume[2]];
 }
 
 /* Five distinct registers: five selections, four data writes and one mixer. */
 _Static_assert(9u * YM_REGISTER_ACCESS_CYCLES + YM_MIXER_WRITE_CYCLES <= UINT8_MAX,
     "transition cost must fit uint8_t");
 
+static inline void add_register_cost(uint8_t *const cost, uint8_t *const latch, const uint8_t reg, const bool changed)
+{
+    if (!changed) return;
+
+    if (*latch != reg) {
+        *cost = (uint8_t)(*cost + YM_REGISTER_ACCESS_CYCLES);
+        *latch = reg;
+    }
+    *cost = (uint8_t)(*cost + (reg == 7u ? YM_MIXER_WRITE_CYCLES : YM_REGISTER_ACCESS_CYCLES));
+}
+
 /* Transition cost. This models the STE YM bus. */
 uint8_t optimizer_transition_cost(const YMState *const old, const YMState *const next)
 {
     uint8_t cost = 0;
-    uint8_t latch = old->selected_register < 0
-        ? UINT8_MAX
-        : (uint8_t)old->selected_register;
+    uint8_t latch = (old->selected_register >= 0 && old->selected_register < YM_REGISTER_COUNT)
+        ? (uint8_t)old->selected_register
+        : UINT8_MAX;
 
     /* Keep this order in sync with scheduler.c. */
-    static const uint8_t order[] = { 7, 6, 8, 9, 10 };
-    for (uint8_t i = 0; i < sizeof(order) / sizeof(order[0]); ++i) {
-        const uint8_t reg = order[i];
-        bool changed = false;
-
-        switch (reg) {
-            case 6: changed = old->noise_period != next->noise_period; break;
-            case 7: changed = old->mixer != next->mixer; break;
-            case 8: changed = old->volume[0] != next->volume[0]; break;
-            case 9: changed = old->volume[1] != next->volume[1]; break;
-            case 10: changed = old->volume[2] != next->volume[2]; break;
-            default: break;
-        }
-
-        if (!changed)
-            continue;
-
-        if (latch != reg) {
-            cost = (uint8_t)(cost + YM_REGISTER_ACCESS_CYCLES);
-            latch = reg;
-        }
-        cost = (uint8_t)(cost + (reg == 7
-            ? YM_MIXER_WRITE_CYCLES : YM_REGISTER_ACCESS_CYCLES));
-    }
+    add_register_cost(&cost, &latch, 7u,  old->mixer != next->mixer);
+    add_register_cost(&cost, &latch, 6u,  old->noise_period != next->noise_period);
+    add_register_cost(&cost, &latch, 8u,  old->volume[0] != next->volume[0]);
+    add_register_cost(&cost, &latch, 9u,  old->volume[1] != next->volume[1]);
+    add_register_cost(&cost, &latch, 10u, old->volume[2] != next->volume[2]);
     return cost;
 }
 
@@ -156,23 +147,22 @@ static void add_candidate(Optimizer *const opt, const YMState *const state, cons
 
     Candidate *const c = &opt->candidates[opt->candidate_count];
     ++(opt->candidate_count);
+    const float amplitude = optimizer_state_output(state);
     c->state = *state;
-    c->state.amplitude = ym_output(&c->state);
-    c->audio_error = fabsf(target - c->state.amplitude);
+    c->state.amplitude = amplitude;
+    c->audio_error = fabsf(target - amplitude);
     c->cycle_cost = optimizer_transition_cost(&opt->current, &c->state);
-    c->total_cost = c->audio_error * AUDIO_WEIGHT + c->cycle_cost;
+    c->total_cost = c->audio_error * AUDIO_WEIGHT + (float)c->cycle_cost;
 }
-
 
 /* Generate nearby tone states. */
 void optimizer_generate_candidates(Optimizer *const opt, const float target)
 {
-    if (opt == NULL || !isfinite(target))
+    if (opt == NULL)
         return;
 
     opt->candidate_count = 0;
-    if (opt->current.volume[0] > 15 || opt->current.volume[1] > 15 ||
-        opt->current.volume[2] > 15)
+    if (!isfinite(target) || !volumes_valid(&opt->current))
         return;
     YMState base = opt->current;
     for (int8_t a = -2; a <= 2; ++a) {
@@ -197,7 +187,7 @@ void optimizer_generate_candidates(Optimizer *const opt, const float target)
        anchors across the full range as well as the local refinement. */
     for (uint8_t volume = 0; volume < 16; ++volume) {
         YMState s = base;
-        s.mixer = (uint8_t)(s.mixer | 0x3fu);
+        s.mixer = (uint8_t)(s.mixer | YM_MIXER_DISABLE_TONE_NOISE);
         s.volume[0] = (uint8_t)volume;
         s.volume[1] = (uint8_t)volume;
         s.volume[2] = (uint8_t)volume;
@@ -215,17 +205,11 @@ void optimizer_generate_candidates_noise(
     const float target,
     SigmaDeltaState *const sd)
 {
-    if (opt == NULL || !isfinite(target))
+    if (opt == NULL)
         return;
 
     opt->candidate_count = 0;
-    if (opt->current.volume[0] > 15 || opt->current.volume[1] > 15 ||
-        opt->current.volume[2] > 15)
-        return;
-
-    const float full_scale = optimizer_output_max();
-
-    if (!isfinite(full_scale) || full_scale <= 0.0f)
+    if (!isfinite(target) || !volumes_valid(&opt->current))
         return;
 
     float decision_target = target;
@@ -233,18 +217,12 @@ void optimizer_generate_candidates_noise(
     if (sd != NULL) {
         if (!isfinite(sd->error))
             return;
-
         decision_target += sd->error;
-
         if (!isfinite(decision_target))
             return;
     }
 
-    /* Saturate the quantizer input to the representable range. */
-    if (decision_target < 0.0f)
-        decision_target = 0.0f;
-    else if (decision_target > full_scale)
-        decision_target = full_scale;
+    decision_target = clampf(decision_target, 0.0f, YM_FULL_SCALE);
 
     optimizer_generate_candidates(opt, decision_target);
 
@@ -252,28 +230,14 @@ void optimizer_generate_candidates_noise(
 
     /* Noise gating must be reversible; a single mixer write disables it. */
     YMState unmodulated = base;
-    unmodulated.mixer = (uint8_t)(unmodulated.mixer | 0x38u);
+    unmodulated.mixer = (uint8_t)(unmodulated.mixer | YM_MIXER_NOISE_BITS);
     if (unmodulated.mixer != base.mixer)
         add_candidate(opt, &unmodulated, decision_target);
 
-    /*
-     * Add noise-assisted candidates.
-     * The noise generator's period is fixed in this statistical model;
-     * accumulated PCM error is not used to fabricate a noise waveform.
-     */
-    for (uint8_t ch = 0; ch < 3; ++ch) {
+    for (uint8_t ch = 0u; ch < 3u; ++ch) {
         YMState state = base;
-
-        /* Enable noise on this channel: mixer bits 3, 4 and 5. */
-        state.mixer = (uint8_t)(
-            state.mixer & (uint8_t)~(1u << (ch + 3u)));
-
+        state.mixer = (uint8_t)(state.mixer & (uint8_t)~(1u << (ch + 3u)));
         state.noise_period = YM_DITHER_NOISE_PERIOD;
-
-        /*
-         * add_candidate() calculates amplitude from the statistical
-         * mixer model and computes error against decision_target.
-         */
         add_candidate(opt, &state, decision_target);
     }
 }
@@ -308,7 +272,6 @@ bool pcm_to_quantizer_target(
 }
 
 /* Sigma-delta feedback. */
-#include <math.h>
 
 /*
  * Bounded first-order error feedback:
@@ -330,47 +293,30 @@ bool optimizer_update_sigma_delta(
         !isfinite(output))
         return false;
 
-    const double full_scale = (double)optimizer_output_max();
+    const float full_scale = YM_FULL_SCALE;
+    const float error = sd->error + input - output;
 
-    if (!isfinite(full_scale) || full_scale <= 0.0)
-        return false;
-
-    /* Use double precision for the intermediate calculation. */
-    double error =
-        (double)sd->error +
-        (double)input -
-        (double)output;
-
-    if (!isfinite(error))
-        return false;
-
-    /* Anti-windup: keep the error within the representable range. */
-    if (error > full_scale)
-        error = full_scale;
-    else if (error < -full_scale)
-        error = -full_scale;
-
-    sd->error = (float)error;
-
+    sd->error = clampf(error, -full_scale, full_scale);
     return isfinite(sd->error);
 }
 
 float optimizer_output_max(void)
 {
-    return 3.0f * ym_volume[15];
+    return YM_FULL_SCALE;
 }
 
 /* Select best current candidate. Used by scheduler fallback. */
 int16_t optimizer_best_candidate(Optimizer *const opt)
 {
-    if (opt == NULL)
+    if (opt == NULL || opt->candidate_count > MAX_CANDIDATES)
         return -1;
 
-    float best = 1e30f;
+    float best = INFINITY;
     int16_t index = -1;
     for (uint8_t i = 0; i < opt->candidate_count; ++i) {
-        if(opt->candidates[i].total_cost < best) {
-            best = opt->candidates[i].total_cost;
+        const float cost = opt->candidates[i].total_cost;
+        if (isfinite(cost) && cost >= 0.0f && cost < best) {
+            best = cost;
             index = (int16_t)i;
         }
     }

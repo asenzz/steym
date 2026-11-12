@@ -83,6 +83,9 @@ uint8_t optimizer_transition_cost(const YMState *old, const YMState *next);
 int16_t optimizer_best_candidate(Optimizer *opt);
 void optimizer_commit(Optimizer *opt, const YMState *state);
 
+/* Estimate the output of a nonnull state with volume levels in 0..15. */
+float optimizer_state_output(const YMState *state);
+
 /* Maximum output amplitude supported by the YM output model. */
 float optimizer_output_max(void);
 

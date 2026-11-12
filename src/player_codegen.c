@@ -16,6 +16,28 @@
 /* Atari ST estimates include the PSG wait state for every write. */
 #define NOP_CYCLES 4u
 
+/* One write per padding run instead of up to 46 stdio calls per slot. */
+static const char nop_padding[] =
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n\tnop\n\tnop\n"
+    "\tnop\n\tnop\n";
+
+_Static_assert((MAX_SLOT_OPERATION_CYCLES + NOP_CYCLES) % NOP_CYCLES == 0,
+               "slot padding requires a whole number of NOPs");
+_Static_assert(sizeof(nop_padding) - 1 >=
+               (MAX_SLOT_OPERATION_CYCLES + NOP_CYCLES) / NOP_CYCLES *
+                   (sizeof("\tnop\n") - 1),
+               "padding text must hold the longest empty slot");
+
 static void emit_select(FILE *const out, const uint8_t reg)
 {
     (void)fprintf(out, "\tmove.b #%u,%s\n", (unsigned)reg, YM_SELECT);
@@ -52,29 +74,24 @@ static void emit_initial_state(FILE *const out)
     emit_data(out, 10, YM_INITIAL_VOLUME);
 }
 
-static int8_t emit_slot(FILE *const out, const SampleSlot *const slot,
-                     const uint32_t index)
+/* Reject inconsistent metadata before emitting this slot's instructions. */
+static int8_t validate_slot(const SampleSlot *const slot, const uint32_t index)
 {
+    if (slot->count > MAX_OPERATIONS ||
+        slot->cycles > MAX_SLOT_OPERATION_CYCLES)
+        return -1;
+
     uint8_t cycles = 0;
     uint8_t latch = slot->initial_latch;
-
-    (void)fprintf(out, "\n;--------------------------------\n");
-    (void)fprintf(out, "; sample slot %" PRIu32 "\n", index);
-    (void)fprintf(out, "; input latch = %u\n", (unsigned)latch);
-
     for (uint8_t i = 0; i < slot->count; ++i) {
-        const YMOperation *const op = &slot->op[i];
-        if (op->reg >= REG_COUNT)
+        const uint8_t reg = slot->op[i].reg;
+        if (reg >= REG_COUNT)
             return -1;
-
-        if (latch != op->reg) {
-            emit_select(out, op->reg);
+        if (latch != reg) {
             cycles += YM_REGISTER_ACCESS_CYCLES;
-            latch = op->reg;
+            latch = reg;
         }
-
-        emit_data(out, op->reg, op->value);
-        cycles = (uint8_t)(cycles + (op->reg == 7
+        cycles = (uint8_t)(cycles + (reg == 7
             ? YM_MIXER_WRITE_CYCLES : YM_REGISTER_ACCESS_CYCLES));
     }
 
@@ -84,21 +101,45 @@ static int8_t emit_slot(FILE *const out, const SampleSlot *const slot,
                       index);
         return -1;
     }
+    return 0;
+}
+
+static int8_t emit_slot(FILE *const out, const SampleSlot *const slot,
+                       const uint32_t index)
+{
+    uint8_t latch = slot->initial_latch;
+
+    if (fprintf(out,
+                "\n;--------------------------------\n"
+                "; sample slot %" PRIu32 "\n"
+                "; input latch = %u\n", index, (unsigned)latch) < 0)
+        return -1;
+
+    for (uint8_t i = 0; i < slot->count; ++i) {
+        const YMOperation *const op = &slot->op[i];
+        if (latch != op->reg) {
+            emit_select(out, op->reg);
+            latch = op->reg;
+        }
+        emit_data(out, op->reg, op->value);
+        if (ferror(out))
+            return -1;
+    }
 
     /* ST RAM bus timing and NOP padding use four-cycle steps. */
     const unsigned slot_cycles = MAX_SLOT_OPERATION_CYCLES + (index % 2u) * NOP_CYCLES;
-    while (cycles < slot_cycles) {
-        (void)fputs("\tnop\n", out);
-        cycles += NOP_CYCLES;
-    }
+    const size_t padding_bytes = (slot_cycles - slot->cycles) / NOP_CYCLES *
+                                 (sizeof("\tnop\n") - 1);
+    if (padding_bytes != 0 &&
+        fwrite(nop_padding, 1, padding_bytes, out) != padding_bytes)
+        return -1;
 
-    (void)fprintf(out, "; estimated cycles=%u\n", (unsigned)cycles);
-    return ferror(out) ? -1 : 0;
+    return fprintf(out, "; estimated cycles=%u\n", slot_cycles) < 0 ? -1 : 0;
 }
 
 int8_t player_codegen_generate(FILE *const out, const ScheduledStream *const stream)
 {
-    if (out == NULL || stream == NULL ||
+    if (out == NULL || ferror(out) || stream == NULL ||
         (stream->count != 0 && stream->slots == NULL))
         return -1;
 
@@ -114,14 +155,15 @@ int8_t player_codegen_generate(FILE *const out, const ScheduledStream *const str
         "ym_player:\n",
         (unsigned)SAMPLE_CYCLES);
 
+    if (ferror(out))
+        return -1;
     emit_initial_state(out);
+    if (ferror(out))
+        return -1;
 
     for (uint32_t i = 0; i < stream->count; ++i) {
         const SampleSlot *const slot = &stream->slots[i];
 
-        if (slot->count > MAX_OPERATIONS ||
-            slot->cycles > MAX_SLOT_OPERATION_CYCLES)
-            return -1;
         if (i == 0 && slot->initial_latch != YM_INITIAL_LATCH) {
             (void)fprintf(stderr,
                           "player_codegen: first slot latch does not match startup state\n");
@@ -132,7 +174,7 @@ int8_t player_codegen_generate(FILE *const out, const ScheduledStream *const str
                           "player_codegen: latch discontinuity at slot %" PRIu32 "\n", i);
             return -1;
         }
-        if (emit_slot(out, slot, i) != 0)
+        if (validate_slot(slot, i) != 0 || emit_slot(out, slot, i) != 0)
             return -1;
     }
 
